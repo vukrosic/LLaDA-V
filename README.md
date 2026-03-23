@@ -4,6 +4,7 @@
 
 
 ## News
+- [2026.03.23] We are excited to introduce [LLaDA-o](https://huggingface.co/GSAI-ML/LLaDA-o), the latest model in the LLaDA series. As an effective and length-adaptive omni diffusion model for unified multimodal understanding and generation, LLaDA-o extends the LLaDA line to broader multimodal settings, supporting visual understanding, text-to-image generation, and instruction-based image editing. For more details, please check out the [paper](https://huggingface.co/papers/2603.01068) and [code](https://github.com/ML-GSAI/LLaDA-o).
 - [2025.06.30] [Fast-dLLM](https://github.com/NVlabs/Fast-dLLM) is now supported in LLaDA-V! This integration accelerates inference latency from 60s to just 6s. Try it out [here](https://github.com/ML-GSAI/LLaDA-V/blob/main/train/generate_demo.py)! 
 - [2025.05.29] We open-sourced the model [LLaDA-V](https://huggingface.co/GSAI-ML/LLaDA-V) and the code of LLaDA-V.
 - [2025.05.23] We have uploaded our paper to [arXiv](https://arxiv.org/abs/2505.16933).

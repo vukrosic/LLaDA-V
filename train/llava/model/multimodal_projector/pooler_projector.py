@@ -21,8 +21,9 @@ class PoolerProjector(nn.Module):
 
     def forward(self, x, *args, **kwargs):
         height = width = self.hw
+        batch_size = x.shape[0]
         assert height * width == x.shape[1]
-        x = x.view(x.shape[0], height, width, -1).permute(0, 3, 1, 2)
+        x = x.view(batch_size, height, width, -1).permute(0, 3, 1, 2)
         x = self.conv_pool(x)
         x = x.flatten(2).transpose(1, 2)
         x = self.proj(x)

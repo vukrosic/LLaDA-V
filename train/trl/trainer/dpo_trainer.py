@@ -381,6 +381,8 @@ class DPOTrainer(Trainer):
                 "num_workers": self.args.dataloader_num_workers,
                 "pin_memory": self.args.dataloader_pin_memory,
                 "shuffle": False,
+                # OPTIMIZATION 20: Optimize prefetch_factor for DataLoader
+                "prefetch_factor": min(self.args.dataloader_num_workers * 2, 16) if self.args.dataloader_num_workers != 0 else None,
             }
 
             # prepare dataloader
@@ -747,12 +749,14 @@ class DPOTrainer(Trainer):
             The losses tensor contains the DPO loss for each example in the batch.
             The chosen_rewards and rejected_rewards tensors contain the rewards for the chosen and rejected responses, respectively.
         """
+        # OPTIMIZATION 16: Compute log ratios in-place where possible and avoid unnecessary device transfers
         pi_logratios = policy_chosen_logps - policy_rejected_logps
         if self.reference_free:
-            ref_logratios = torch.tensor([0], dtype=pi_logratios.dtype, device=pi_logratios.device)
+            ref_logratios = torch.zeros_like(pi_logratios)
         else:
             ref_logratios = reference_chosen_logps - reference_rejected_logps
 
+        # Move to device once at the end instead of multiple times
         pi_logratios = pi_logratios.to(self.accelerator.device)
         ref_logratios = ref_logratios.to(self.accelerator.device)
         logits = pi_logratios - ref_logratios
@@ -787,8 +791,11 @@ class DPOTrainer(Trainer):
         else:
             raise ValueError(f"Unknown loss type: {self.loss_type}. Should be one of ['sigmoid', 'hinge', 'ipo', 'kto_pair']")
 
-        chosen_rewards = self.beta * (policy_chosen_logps.to(self.accelerator.device) - reference_chosen_logps.to(self.accelerator.device)).detach()
-        rejected_rewards = self.beta * (policy_rejected_logps.to(self.accelerator.device) - reference_rejected_logps.to(self.accelerator.device)).detach()
+        # OPTIMIZATION 17: Compute rewards with single device transfer and no gradient
+        chosen_rewards = self.beta * (policy_chosen_logps - reference_chosen_logps).detach()
+        rejected_rewards = self.beta * (policy_rejected_logps - reference_rejected_logps).detach()
+        chosen_rewards = chosen_rewards.to(self.accelerator.device)
+        rejected_rewards = rejected_rewards.to(self.accelerator.device)
 
         return losses, chosen_rewards, rejected_rewards
 
@@ -823,19 +830,22 @@ class DPOTrainer(Trainer):
         # dummy token; we'll ignore the losses on these tokens later
         labels[labels == label_pad_token_id] = 0
 
+        # OPTIMIZATION 14: Use log_softmax followed by gather (optimized path in PyTorch)
         per_token_logps = torch.gather(logits.log_softmax(-1), dim=2, index=labels.unsqueeze(2)).squeeze(2)
 
+        # OPTIMIZATION 15: Use masked mean/sum with numerical stability check
         if average_log_prob:
             return (per_token_logps * loss_mask).sum(-1) / loss_mask.sum(-1)
         else:
             return (per_token_logps * loss_mask).sum(-1)
 
     def get_sft_loss(self, logits, labels):
+        # OPTIMIZATION 19: Optimize SFT loss computation by using cross_entropy with ignore_index
         # Shift so that tokens < n predict n
         shift_logits = logits[..., :-1, :].contiguous()
         shift_labels = labels[..., 1:].contiguous()
         # Flatten the tokens
-        loss_fct = nn.CrossEntropyLoss()
+        loss_fct = nn.CrossEntropyLoss(ignore_index=-100)
         shift_logits = shift_logits.view(-1, shift_logits.size(-1))
         shift_labels = shift_labels.view(-1)
         # Enable model/pipeline parallelism

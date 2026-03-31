@@ -62,10 +62,14 @@ class HFVisionTower(nn.Module):
 
     def forward(self, images):
         if type(images) is list:
+            vision_tower = self.vision_tower
+            feature_select = self.feature_select
+            device = self.device
+            dtype = self.dtype
             image_features = []
             for image in images:
-                image_forward_out = self.vision_tower(image.to(device=self.device, dtype=self.dtype).unsqueeze(0), output_hidden_states=True)
-                image_feature = self.feature_select(image_forward_out).to(image.dtype)
+                image_forward_out = vision_tower(image.to(device=device, dtype=dtype).unsqueeze(0), output_hidden_states=True)
+                image_feature = feature_select(image_forward_out).to(image.dtype)
                 image_features.append(image_feature)
         else:
             image_forward_outs = self.vision_tower(images.to(device=self.device, dtype=self.dtype), output_hidden_states=True)

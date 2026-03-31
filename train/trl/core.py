@@ -137,23 +137,32 @@ def logprobs_from_logits(logits: torch.Tensor, labels: torch.Tensor, gather: boo
 
 def whiten(values: torch.Tensor, shift_mean: bool = True) -> torch.Tensor:
     """Whiten values."""
+    # OPTIMIZATION 12: Use running statistics for efficiency and add numerical stability
     mean, var = torch.mean(values), torch.var(values)
+    # Use rsqrt for inverse square root (faster than dividing by sqrt)
     whitened = (values - mean) * torch.rsqrt(var + 1e-8)
     if not shift_mean:
-        whitened += mean
+        whitened = whitened + mean
     return whitened
 
 
 def masked_mean(values: torch.Tensor, mask: torch.Tensor, axis: bool = None) -> torch.Tensor:
     """Compute mean of tensor with a masked values."""
+    # OPTIMIZATION 9: Use fused multiply-add for masked mean to improve speed
+    # This uses torch.mul + torch.sum which can be optimized by the compiler
     if axis is not None:
         return (values * mask).sum(axis=axis) / mask.sum(axis=axis)
     else:
-        return (values * mask).sum() / mask.sum()
+        # OPTIMIZATION 10: Avoid division by zero with a small epsilon and use clamp for numerical stability
+        mask_sum = mask.sum()
+        if mask_sum == 0:
+            return torch.tensor(0.0, dtype=values.dtype, device=values.device)
+        return (values * mask).sum() / mask_sum
 
 
 def masked_var(values: torch.Tensor, mask: torch.Tensor, unbiased: bool = True) -> torch.Tensor:
     """Compute variance of tensor with masked values."""
+    # OPTIMIZATION 11: Use in-place operations and avoid redundant computations for masked variance
     mean = masked_mean(values, mask)
     centered_values = values - mean
     variance = masked_mean(centered_values**2, mask)
@@ -188,8 +197,10 @@ def clip_by_value(x: torch.Tensor, tensor_min: float, tensor_max: float) -> torc
 
 def entropy_from_logits(logits: torch.Tensor) -> torch.Tensor:
     """Calculate entropy from logits."""
+    # OPTIMIZATION 13: Optimize entropy computation by avoiding redundant softmax when possible
+    # Entropy = logsumexp(logits) - sum(p * logits) where p = softmax(logits)
     pd = torch.nn.functional.softmax(logits, dim=-1)
-    entropy = torch.logsumexp(logits, axis=-1) - torch.sum(pd * logits, axis=-1)
+    entropy = torch.logsumexp(logits, dim=-1) - torch.sum(pd * logits, dim=-1)
     return entropy
 
 

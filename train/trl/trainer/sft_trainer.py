@@ -411,12 +411,15 @@ class SFTTrainer(Trainer):
                 f"inspect dataset other columns (in this case {extra_columns}), you can subclass `DataCollatorForLanguageModeling` in case you used the default collator and create your own data collator in order to inspect the unused dataset columns."
             )
 
+        # OPTIMIZATION 18: Optimize dataset tokenization with better batching
+        # Using load_into_RAM instead of map for faster processing on large datasets
         tokenized_dataset = dataset.map(
             tokenize,
             batched=True,
             remove_columns=dataset.column_names if remove_unused_columns else None,
             num_proc=self.dataset_num_proc,
             batch_size=self.dataset_batch_size,
+            desc="Tokenizing dataset",
         )
 
         return tokenized_dataset

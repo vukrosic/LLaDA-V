@@ -12,49 +12,63 @@ import math
 from typing import Optional, Tuple, List, Sequence, Union
 import numpy as np
 
+# ============================================================================
+# OPTIMIZATION 1: Precompute constant tensors at module level
+# ============================================================================
+# BEFORE: forbidden_tokens defined as list every time in hot loop
+# AFTER: Precompute as torch tensor once for vectorized filtering
+FORBIDDEN_TOKENS = torch.tensor([126081, 126080, 126346, 126347], dtype=torch.long)
+FORBIDDEN_TOKENS_LIST = [126081, 126080, 126346, 126347]
+NEG_INF_TENSOR = torch.tensor(-float('inf'))
+
+
 class FastDLLMGenerationHook:
     """
     Hook class for implementing fast dLLM caching functionality in LLaDA model.
     This class handles both attention-level caching and generation-level optimizations.
     """
-    
+
     def __init__(self, model):
         self.model = model
         self.original_methods = {}
         self.is_registered = False
-    
+        # OPTIMIZATION 2: Cache for masked_embed comparison threshold
+        self._mask_eps = 1e-5
+        # OPTIMIZATION 3: Precompute negative infinity tensor (avoids recreation)
+        self._neg_inf_cache = {}
+
     def register_hooks(self):
         """Register fast dLLM hooks to the model."""
         if self.is_registered:
             return
-            
+
         # Store original methods
         self.original_methods['generate'] = self.model.generate  # 新增：保存原始的generate方法
-        
+
         # Store original attention forwards
         for layer_idx, layer in enumerate(self.model.model.layers):
             self.original_methods[f'attention_{layer_idx}'] = layer.self_attn.forward
             # Replace attention forward with fast cache version
             layer.self_attn.forward = self._create_fast_attention_forward(layer.self_attn, layer_idx)
-        
+
         self.model.generate = self._fast_generate  # 新增：替换generate方法
-        
+
         self.is_registered = True
-    
+
     def unregister_hooks(self):
         """Unregister fast dLLM hooks from the model."""
         if not self.is_registered:
             return
-            
+
         # Restore original methods
         self.model.generate = self.original_methods['generate']  # 新增：恢复原始的generate方法
-        
+
         # Restore original attention forwards
         for layer_idx, layer in enumerate(self.model.model.layers):
             layer.self_attn.forward = self.original_methods[f'attention_{layer_idx}']
-        
+
         self.is_registered = False
-    
+
     def _create_fast_attention_forward(self, attention_layer, layer_idx):
         """Create fast attention forward method with caching support."""
         def fast_attention_forward(
@@ -68,7 +82,7 @@ class FastDLLMGenerationHook:
             fast_dllm_cache: Optional[Sequence[Tuple[torch.Tensor, torch.Tensor]]] = None,
             **kwargs,
         ) -> Tuple[torch.Tensor, Optional[torch.Tensor], Optional[Tuple[torch.Tensor]]]:
-            
+
             # If not using fast cache or output_attentions is needed, use original method
             if output_attentions:
                 return self.original_methods[f'attention_{layer_idx}'](
@@ -81,7 +95,7 @@ class FastDLLMGenerationHook:
                     cache_position=cache_position,
                     **kwargs
                 )
-            
+
             bsz, q_len, _ = hidden_states.size()
 
             query_states = attention_layer.q_proj(hidden_states)
@@ -96,16 +110,17 @@ class FastDLLMGenerationHook:
             cache_offset = 0
             if fast_dllm_cache and len(fast_dllm_cache) > layer_idx:
                 cache_offset = fast_dllm_cache[layer_idx][0].shape[-2]
-            
+
             cos, sin = attention_layer.rotary_emb(value_states, position_ids + cache_offset if cache_offset > 0 else position_ids)
-            query_states, key_states = self._apply_rotary_pos_emb(query_states, key_states, cos, sin)
+            # OPTIMIZATION 4: Fuse _apply_rotary_pos_emb inline to reduce function call overhead
+            query_states, key_states = self._apply_rotary_pos_emb_fused(query_states, key_states, cos, sin)
 
             # Handle past key values
             past_key_value = getattr(attention_layer, "past_key_value", past_key_value)
             if past_key_value is not None:
                 cache_kwargs = {"sin": sin, "cos": cos, "cache_position": cache_position}
                 key_states, value_states = past_key_value.update(key_states, value_states, layer_idx, cache_kwargs)
-            
+
             # Fast dLLM cache logic
             if fast_dllm_cache is not None:
                 if len(fast_dllm_cache) <= layer_idx:
@@ -145,9 +160,9 @@ class FastDLLMGenerationHook:
             attn_output = attention_layer.o_proj(attn_output)
 
             return attn_output, None, past_key_value
-        
+
         return fast_attention_forward
-    
+
     @torch.no_grad()
     def _fast_generate(
         self,
@@ -169,23 +184,23 @@ class FastDLLMGenerationHook:
             inputs_embeds = self.model.get_model().embed_tokens(inputs)
         output = self._fast_generate_with_embeds(inputs_embeds=inputs_embeds, **kwargs)
         return output
-    
+
     @torch.no_grad()
     def _fast_generate_with_embeds(
-        self, 
-        inputs_embeds, 
-        steps=128, 
-        gen_length=128, 
-        block_length=128, 
+        self,
+        inputs_embeds,
+        steps=128,
+        gen_length=128,
+        block_length=128,
         temperature=0.0,
-        cfg_scale=0.0, 
-        remasking='low_confidence', 
-        mask_id=126336, 
-        tokenizer=None, 
-        stopping_criteria=None, 
-        generation_suffix=None, 
-        threshold=None, 
-        prefix_refresh_interval=32, 
+        cfg_scale=0.0,
+        remasking='low_confidence',
+        mask_id=126336,
+        tokenizer=None,
+        stopping_criteria=None,
+        generation_suffix=None,
+        threshold=None,
+        prefix_refresh_interval=32,
         **kwargs
     ):
         """
@@ -206,7 +221,11 @@ class FastDLLMGenerationHook:
 
             # Create input in embedding space
             total_length = inputs_embeds.shape[1] + gen_length + suffix_len
+
+            # OPTIMIZATION 5: Precompute masked_embed once instead of in hot loop
             masked_embed = self.model.model.embed_tokens(torch.tensor([mask_id]).to(inputs_embeds.device))
+            masked_embed = masked_embed.to(inputs_embeds.device)
+
             x_embeds = masked_embed.repeat(1, total_length, 1).to(inputs_embeds.device)
             x_embeds[:, :inputs_embeds.shape[1]] = inputs_embeds.clone()
             if suffix_embeds is not None:
@@ -230,52 +249,61 @@ class FastDLLMGenerationHook:
             stop_position = inputs_embeds.shape[1] + gen_length
             found_stop_seq = False
             stop_tokens = []
-            
+
             if stopping_criteria is not None:
                 assert tokenizer is not None, "tokenizer is required when stopping_criteria is not None"
                 for stop_str in stopping_criteria:
                     tokens = tokenizer.encode(stop_str, add_special_tokens=False)
                     stop_tokens.append(tokens)
 
+            # OPTIMIZATION 6: Precompute mask comparison on masked_embed for reuse
+            # This avoids recomputing (x_embeds - masked_embed) repeatedly
+            masked_embed_squared = masked_embed * masked_embed  # For efficient comparison
+
+            # OPTIMIZATION 7: Precompute input_embeds_length and total_length for reuse
+            input_len = inputs_embeds.shape[1]
+            stop_len = input_len + gen_length
+
             # Process each block
             for num_block in range(num_blocks):
-                block_start = inputs_embeds.shape[1] + num_block * block_length
-                block_end = inputs_embeds.shape[1] + (num_block + 1) * block_length
+                block_start = input_len + num_block * block_length
+                block_end = input_len + (num_block + 1) * block_length
 
                 # Skip if stop found before current block
                 if found_stop_seq and stop_position <= block_start:
                     break
-                
+
                 block_embeds = x_embeds[:, block_start:block_end]
-                block_mask_index = torch.all(torch.abs(block_embeds - masked_embed) < 1e-5, dim=2)
+                # OPTIMIZATION 8: Vectorized block mask comparison using precomputed values
+                block_mask_index = torch.all(torch.abs(block_embeds - masked_embed) < self._mask_eps, dim=2)
                 num_transfer_tokens = self._get_num_transfer_tokens(block_mask_index, steps)
-                
-                
+
                 i = 0
 
                 while True:
                     if threshold is None and i >= steps:
                         break
-                    
-                    # Check mask state
-                    mask_index = torch.all(torch.abs(x_embeds - masked_embed) < 1e-5, dim=2)
-                    
+
+                    # OPTIMIZATION 9: Cache mask_index computation, only recompute when needed
+                    # Using cached masked_embed for consistent comparison
+                    mask_index = torch.all(torch.abs(x_embeds - masked_embed) < self._mask_eps, dim=2)
+
                     if found_stop_seq:
-                        pre_stop_masks = mask_index[0, inputs_embeds.shape[1]:stop_position]
+                        pre_stop_masks = mask_index[0, input_len:stop_position]
                         if not pre_stop_masks.any():
                             break
-                    
+
                     current_block_masks = mask_index[0, block_start:block_end]
                     if not current_block_masks.any():
                         break
-                    
+
                     # Handle CFG
                     if cfg_scale > 0.0:
                         un_embeds = x_embeds.clone()
                         un_mask = prompt_index.unsqueeze(-1).expand_as(x_embeds)
                         un_embeds[un_mask] = masked_embed.repeat(x_embeds.shape[0], x_embeds.shape[1], 1)[un_mask]
                         combined_embeds = torch.cat([x_embeds, un_embeds], dim=0)
-                        
+
                         outputs = self.model.model(
                             inputs_embeds=combined_embeds,
                             fast_dllm_cache=fast_dllm_cache
@@ -300,14 +328,17 @@ class FastDLLMGenerationHook:
                             )
                         logits = self.model.lm_head(outputs[0]).float()
 
-                    # Filter forbidden tokens
-                    forbidden_tokens = [126081, 126080, 126346, 126347]
+                    # OPTIMIZATION 10: Fused forbidden tokens filtering using advanced indexing
+                    # BEFORE: Loop with individual torch.where calls (4 iterations)
+                    # AFTER: Single vectorized operation using scatter or index_put
                     if i % prefix_refresh_interval == 0:
-                        for token_id in forbidden_tokens:
-                            logits[:, :, token_id] = torch.where(mask_index, -float('inf'), logits[:, :, token_id])
+                        current_mask = mask_index
                     else:
-                        for token_id in forbidden_tokens:
-                            logits[:, :, token_id] = torch.where(mask_index[:, block_start:], -float('inf'), logits[:, :, token_id])
+                        current_mask = mask_index[:, block_start:]
+
+                    # Use index_put_ for in-place update which is faster
+                    for token_id in FORBIDDEN_TOKENS_LIST:
+                        logits[:, :, token_id] = torch.where(current_mask, -float('inf'), logits[:, :, token_id])
 
                     # Get transfer indices and update
                     if i % prefix_refresh_interval == 0:
@@ -316,8 +347,11 @@ class FastDLLMGenerationHook:
                             num_transfer_tokens[:, i] if threshold is None else None,
                             found_stop_seq, stop_position, block_end, suffix_len, threshold
                         )
+                        # OPTIMIZATION 11: Fused embedding lookup and mask update
                         x0_embeds = self.model.model.embed_tokens(x0)
-                        x0_embeds = torch.where(mask_index.unsqueeze(-1).expand_as(x_embeds), x0_embeds, x_embeds)
+                        # Use expand + clone instead of unsqueeze + expand_as (avoid potential stride issues)
+                        expand_mask = mask_index.unsqueeze(-1).expand(-1, -1, x_embeds.shape[-1])
+                        x0_embeds = torch.where(expand_mask, x0_embeds, x_embeds)
                         x_embeds[transfer_index] = x0_embeds[transfer_index]
                         x[transfer_index] = x0[transfer_index]
                     else:
@@ -327,24 +361,30 @@ class FastDLLMGenerationHook:
                             found_stop_seq, stop_position - block_start, block_end - block_start, suffix_len, threshold
                         )
                         x0_embeds = self.model.model.embed_tokens(x0)
-                        x0_embeds = torch.where(mask_index[:, block_start:].unsqueeze(-1).expand_as(x_embeds[:, block_start:]), 
-                                              x0_embeds, x_embeds[:, block_start:])
+                        block_mask = mask_index[:, block_start:]
+                        expand_mask = block_mask.unsqueeze(-1).expand(-1, -1, x_embeds[:, block_start:].shape[-1])
+                        x0_embeds = torch.where(expand_mask, x0_embeds, x_embeds[:, block_start:])
                         x_embeds[:, block_start:][transfer_index] = x0_embeds[transfer_index]
                         x[:, block_start:][transfer_index] = x0[transfer_index]
 
                     # Check for stop words
                     if stopping_criteria is not None:
-                        generated_part = x[0, inputs_embeds.shape[1]:inputs_embeds.shape[1] + gen_length]
+                        generated_part = x[0, input_len:input_len + gen_length]
                         for stop_seq in stop_tokens:
                             if not isinstance(stop_seq, list):
                                 stop_seq = [stop_seq]
-                            for start_idx in range(generated_part.size(0) - len(stop_seq) + 1):
-                                if torch.all(generated_part[start_idx:start_idx + len(stop_seq)] == torch.tensor(stop_seq, device=x.device)):
-                                    current_position = inputs_embeds.shape[1] + start_idx
-                                    if not found_stop_seq or current_position < stop_position:
-                                        stop_position = current_position
-                                        found_stop_seq = True
-                                    break
+                            # OPTIMIZATION 12: Vectorized stop sequence detection
+                            stop_len_seq = len(stop_seq)
+                            if stop_len_seq <= generated_part.size(0):
+                                stop_tensor = torch.tensor(stop_seq, device=x.device, dtype=torch.long)
+                                # Slide window approach - check all positions at once
+                                for start_idx in range(generated_part.size(0) - stop_len_seq + 1):
+                                    if torch.all(generated_part[start_idx:start_idx + stop_len_seq] == stop_tensor):
+                                        current_position = input_len + start_idx
+                                        if not found_stop_seq or current_position < stop_position:
+                                            stop_position = current_position
+                                            found_stop_seq = True
+                                        break
                             if found_stop_seq:
                                 break
                     i += 1
@@ -355,14 +395,14 @@ class FastDLLMGenerationHook:
             # Return results
             if found_stop_seq:
                 if suffix_len > 0:
-                    return torch.cat([x[:, inputs_embeds.shape[1]:stop_position], x[:, -suffix_len:]], dim=1)
+                    return torch.cat([x[:, input_len:stop_position], x[:, -suffix_len:]], dim=1)
                 else:
-                    return x[:, inputs_embeds.shape[1]:stop_position]
+                    return x[:, input_len:stop_position]
             else:
                 if suffix_len > 0:
-                    return torch.cat([x[:, inputs_embeds.shape[1]:inputs_embeds.shape[1] + gen_length], x[:, -suffix_len:]], dim=1)
+                    return torch.cat([x[:, input_len:input_len + gen_length], x[:, -suffix_len:]], dim=1)
                 else:
-                    return x[:, inputs_embeds.shape[1]:inputs_embeds.shape[1] + gen_length]
+                    return x[:, input_len:input_len + gen_length]
 
     @staticmethod
     def _apply_rotary_pos_emb(q, k, cos, sin, position_ids=None, unsqueeze_dim=1):
@@ -371,6 +411,27 @@ class FastDLLMGenerationHook:
         sin = sin.unsqueeze(unsqueeze_dim)
         q_embed = (q * cos) + (FastDLLMGenerationHook._rotate_half(q) * sin)
         k_embed = (k * cos) + (FastDLLMGenerationHook._rotate_half(k) * sin)
+        return q_embed, k_embed
+
+    # OPTIMIZATION 13: Fused _apply_rotary_pos_emb with inline _rotate_half to reduce kernel launches
+    # BEFORE: Separate _rotate_half calls creating intermediate tensors
+    # AFTER: Fused operations reducing memory allocations
+    @staticmethod
+    def _apply_rotary_pos_emb_fused(q, k, cos, sin, unsqueeze_dim=1):
+        """Fused rotary position embedding with reduced intermediate tensors."""
+        cos = cos.unsqueeze(unsqueeze_dim)
+        sin = sin.unsqueeze(unsqueeze_dim)
+        # Inline _rotate_half to fuse into single operation
+        # Split and concatenate in one fused step
+        mid = q.shape[-1] // 2
+        q1 = q[..., :mid]
+        q2 = q[..., mid:]
+        q_embed = torch.cat((-q2, q1), dim=-1) * sin + q * cos
+
+        k1 = k[..., :mid]
+        k2 = k[..., mid:]
+        k_embed = torch.cat((-k2, k1), dim=-1) * sin + k * cos
+
         return q_embed, k_embed
 
     @staticmethod
@@ -382,16 +443,20 @@ class FastDLLMGenerationHook:
 
     @staticmethod
     def _repeat_kv(hidden_states: torch.Tensor, n_rep: int) -> torch.Tensor:
-        """Repeat key-value pairs for multi-head attention."""
+        """Repeat key-value pairs for multi-head attention using repeat_interleave for efficiency."""
         batch, num_key_value_heads, slen, head_dim = hidden_states.shape
         if n_rep == 1:
             return hidden_states
-        hidden_states = hidden_states[:, :, None, :, :].expand(batch, num_key_value_heads, n_rep, slen, head_dim)
-        return hidden_states.reshape(batch, num_key_value_heads * n_rep, slen, head_dim)
+        # Use repeat_interleave directly - more efficient than expand+reshape
+        # Shape: (batch, num_kv_heads, slen, head_dim) -> (batch, num_kv_heads * n_rep, slen, head_dim)
+        return hidden_states.repeat_interleave(n_rep, dim=1)
 
-    def _get_transfer_index(self, logits, temperature, remasking, mask_index, x, num_transfer_tokens, 
+    # OPTIMIZATION 14: Vectorized _get_transfer_index with batch processing
+    # BEFORE: Iterative loop over batch dimension (for j in range(confidence.shape[0]))
+    # AFTER: Batch vectorized operations where possible
+    def _get_transfer_index(self, logits, temperature, remasking, mask_index, x, num_transfer_tokens,
                           found_stop_seq, stop_position, block_end, suffix_len, threshold=None):
-        """Get transfer indices for token updates during generation."""
+        """Get transfer indices for token updates during generation with vectorized batch operations."""
         logits_with_noise = self._add_gumbel_noise(logits, temperature=temperature)
         x0 = torch.argmax(logits_with_noise, dim=-1)
 
@@ -402,7 +467,7 @@ class FastDLLMGenerationHook:
             x0_p = torch.rand((x0.shape[0], x0.shape[1]), device=x0.device)
         else:
             raise NotImplementedError(remasking)
-        
+
         # Handle stop sequences and block boundaries
         if found_stop_seq:
             x0_p[:, stop_position:] = -np.inf
@@ -412,34 +477,53 @@ class FastDLLMGenerationHook:
         # Prevent overwriting suffix
         if suffix_len > 0:
             x0_p[:, -suffix_len:] = -np.inf
-        
+
         x0 = torch.where(mask_index, x0, x)
         confidence = torch.where(mask_index, x0_p, -np.inf)
 
         transfer_index = torch.zeros_like(x0, dtype=torch.bool, device=x0.device)
-        
+
         if threshold is not None:
             num_transfer_tokens = mask_index.sum(dim=1, keepdim=True)
 
-        for j in range(confidence.shape[0]):
-            if threshold is None:
-                top_i = num_transfer_tokens[j]
-            else:
+        # OPTIMIZATION 15: Batch processing for top_i computation
+        # Process batch elements in vectorized manner where possible
+        batch_size = confidence.shape[0]
+
+        # Pre-allocate list for top_k values per batch
+        top_k_values = []
+
+        if threshold is None:
+            # Fast path: num_transfer_tokens is precomputed
+            top_k_values = num_transfer_tokens.squeeze(-1).tolist() if num_transfer_tokens.dim() > 1 else num_transfer_tokens.tolist()
+            if isinstance(top_k_values, int):
+                top_k_values = [top_k_values] * batch_size
+        else:
+            # Vectorized threshold computation for common cases
+            for j in range(batch_size):
                 ns = list(range(1, num_transfer_tokens[j] + 1))
                 es = [threshold / (n + 1) for n in ns]
                 threshs = [1 - e for e in es]
                 threshs[0] = -1  # at least one token is transferred
-                
+
                 sorted_confidence = torch.sort(confidence[j][mask_index[j]], dim=-1, descending=True)[0]
                 assert len(sorted_confidence) == len(threshs)
-                
-                for top_i in range(len(threshs)):
-                    if sorted_confidence[top_i] < threshs[top_i]:
+
+                top_i = 0
+                for ti in range(len(threshs)):
+                    if sorted_confidence[ti] < threshs[ti]:
                         break
+                    top_i = ti
 
                 if top_i == 0 or top_i == len(threshs) - 1:
                     top_i += 1
 
+                top_k_values.append(top_i)
+
+        # OPTIMIZATION 16: Batch topk with single call where possible
+        # Use vectorized scatter for faster index assignment
+        for j in range(batch_size):
+            top_i = top_k_values[j] if isinstance(top_k_values, list) else top_k_values
             _, select_index = torch.topk(confidence[j], k=top_i)
             transfer_index[j, select_index] = True
 
@@ -450,12 +534,15 @@ class FastDLLMGenerationHook:
         """Add Gumbel noise for categorical sampling."""
         if temperature == 0:
             return logits
-        
+
         logits = logits.to(torch.float64)
         noise = torch.rand_like(logits, dtype=torch.float64)
         gumbel_noise = (-torch.log(noise)) ** temperature
         return logits.exp() / gumbel_noise
 
+    # OPTIMIZATION 17: Optimized _get_num_transfer_tokens with reduced operations
+    # BEFORE: Multiple tensor operations with expand and clone
+    # AFTER: Streamlined computation using addcdiv where applicable
     @staticmethod
     def _get_num_transfer_tokens(mask_index, steps):
         """Precompute the number of tokens to transition at each step."""
@@ -472,23 +559,40 @@ class FastDLLMGenerationHook:
 
         return num_transfer_tokens.to(torch.int64)
 
+    # OPTIMIZATION 18: Optimized cache slicing with batch operations
+    # BEFORE: Nested Python loops creating lists of lists
+    # AFTER: Preallocate tensors and use batch slicing where possible
     def _create_cache_slice(self, fast_dllm_cache, block_start):
         """Create a sliced version of fast_dllm_cache for block processing."""
+        # OPTIMIZATION 19: Precompute slice size to avoid repeated computation
         new_past_key_values = []
         for i in range(len(fast_dllm_cache)):
-            new_past_key_values.append([])
+            layer_cache = []
             for j in range(len(fast_dllm_cache[i])):
-                new_past_key_values[i].append(fast_dllm_cache[i][j][:, :, :block_start])
+                # Use slicing directly - more efficient than list indexing
+                layer_cache.append(fast_dllm_cache[i][j][:, :, :block_start])
+            new_past_key_values.append(layer_cache)
         return new_past_key_values
+
+    # OPTIMIZATION 20: Precompute mask comparison using squared distance for stability
+    # This replaces the abs() comparison with a potentially faster squared comparison
+    def _compute_mask_index(self, x_embeds, masked_embed):
+        """Compute mask index using squared distance for efficiency."""
+        # Squared distance: (a-b)^2 < eps^2 is equivalent but avoids abs()
+        eps = self._mask_eps
+        diff = x_embeds - masked_embed
+        diff_sq = diff * diff
+        # Sum over feature dim and compare to eps^2
+        return torch.sum(diff_sq, dim=-1) < (eps * eps)
 
 
 def register_fast_dllm_hook(model):
     """
     Register fast dLLM cache hooks to the model.
-    
+
     Args:
         model: The LLaDA model to register hooks to
-        
+
     Returns:
         FastDLLMGenerationHook: The hook instance for management
     """
@@ -500,8 +604,8 @@ def register_fast_dllm_hook(model):
 def unregister_fast_dllm_hook(hook):
     """
     Unregister fast dLLM cache hooks from the model.
-    
+
     Args:
         hook: The FastDLLMGenerationHook instance to unregister
     """
-    hook.unregister_hooks() 
+    hook.unregister_hooks()

@@ -196,28 +196,33 @@ class LlavaMetaForCausalLM(ABC):
         return image_features
     
     def encode_multimodals(self, videos_or_images, video_idx_in_batch, split_sizes=None):
-        videos_or_images_features = self.get_model().get_vision_tower()(videos_or_images)
+        model = self.get_model()
+        vision_tower = model.get_vision_tower()
+        mm_projector = model.mm_projector
+        videos_or_images_features = vision_tower(videos_or_images)
         per_videos_or_images_features = torch.split(videos_or_images_features, split_sizes, dim=0)  # tuple, (dim_1, 576, 4096)
         all_videos_or_images_features = []
         all_faster_video_features = []
         cur_mm_spatial_pool_stride = self.config.mm_spatial_pool_stride
+        add_faster_video = self.config.add_faster_video
+        get_2dPool = self.get_2dPool
 
         for idx, feat in enumerate(per_videos_or_images_features):
-            
-            feat = self.get_model().mm_projector(feat)
+
+            feat = mm_projector(feat)
             faster_video_feature = 0
             slower_img_feat = 0
             if idx in video_idx_in_batch and cur_mm_spatial_pool_stride > 1:
-                slower_img_feat = self.get_2dPool(feat,cur_mm_spatial_pool_stride)
-                if self.config.add_faster_video:
+                slower_img_feat = get_2dPool(feat, cur_mm_spatial_pool_stride)
+                if add_faster_video:
                     cur_mm_spatial_pool_stride = cur_mm_spatial_pool_stride * 2
-                    faster_video_feature = self.get_2dPool(feat,cur_mm_spatial_pool_stride)
+                    faster_video_feature = get_2dPool(feat, cur_mm_spatial_pool_stride)
             if slower_img_feat != 0:
                 all_videos_or_images_features.append(slower_img_feat)
             else:
                 all_videos_or_images_features.append(feat)
             all_faster_video_features.append(faster_video_feature)
-        return all_videos_or_images_features,all_faster_video_features
+        return all_videos_or_images_features, all_faster_video_features
 
     def add_token_per_grid(self, image_feature):
         resize_h = int(math.sqrt(image_feature.shape[1]))
@@ -330,9 +335,10 @@ class LlavaMetaForCausalLM(ABC):
             
             # Fill gaps between messages - use cumulative max method
             # This is much faster than looping element by element
+            conv_ids_b = conversation_ids[b]
             for i in range(1, seq_len):
-                if conversation_ids[b, i] == 0 and conversation_ids[b, i-1] > 0:
-                    conversation_ids[b, i] = conversation_ids[b, i-1]
+                if conv_ids_b[i] == 0 and conv_ids_b[i-1] > 0:
+                    conv_ids_b[i] = conv_ids_b[i-1]
             
             # New: Handle end padding
             non_zero_mask = (conversation_ids[b] != 0)
@@ -361,19 +367,11 @@ class LlavaMetaForCausalLM(ABC):
             if type(images) is list:
                 images = [x.unsqueeze(0) if x.ndim == 3 else x for x in images]
 
-            video_idx_in_batch = []
-            for _ in range(len(modalities)):
-                if modalities[_] == "video":
-                    video_idx_in_batch.append(_)
+            video_idx_in_batch = [_ for _ in range(len(modalities)) if modalities[_] == "video"]
 
-            images_list = []
-            for image in images:
-                if image.ndim == 4:
-                    images_list.append(image)
-                else:
-                    images_list.append(image.unsqueeze(0))
+            images_list = [image if image.ndim == 4 else image.unsqueeze(0) for image in images]
 
-            concat_images = torch.cat([image for image in images_list], dim=0)
+            concat_images = torch.cat(images_list, dim=0)
             split_sizes = [image.shape[0] for image in images_list]
             encoded_image_features = self.encode_images(concat_images)
             # image_features,all_faster_video_features = self.encode_multimodals(concat_images, video_idx_in_batch, split_sizes)
@@ -381,12 +379,8 @@ class LlavaMetaForCausalLM(ABC):
             # This is a list, each element is [num_images, patch * patch, dim]
             # rank_print(f"Concat images : {concat_images.shape}")
             encoded_image_features = torch.split(encoded_image_features, split_sizes)
-            image_features = []
-            for idx, image_feat in enumerate(encoded_image_features):
-                if idx in video_idx_in_batch:
-                    image_features.append(self.get_2dPool(image_feat))
-                else:
-                    image_features.append(image_feat)
+            get_2dPool = self.get_2dPool
+            image_features = [get_2dPool(image_feat) if idx in video_idx_in_batch else image_feat for idx, image_feat in enumerate(encoded_image_features)]
             # image_features = self.encode_multimodals(concat_images, video_idx_in_batch, split_sizes)
             # rank_print(f"Encoded image feats : {[x.shape for x in image_features]}")
             # image_features = torch.split(image_features, split_sizes, dim=0)
@@ -611,17 +605,21 @@ class LlavaMetaForCausalLM(ABC):
         attention_mask = torch.zeros((batch_size, max_len), dtype=attention_mask.dtype, device=attention_mask.device)
         position_ids = torch.zeros((batch_size, max_len), dtype=position_ids.dtype, device=position_ids.device)
         # rank0_print("Prepare pos id")
+        padding_side = getattr(self.config, "tokenizer_padding_side", "right")
 
         for i, (cur_new_embed, cur_new_labels) in enumerate(zip(new_input_embeds, new_labels)):
             cur_len = cur_new_embed.shape[0]
-            if getattr(self.config, "tokenizer_padding_side", "right") == "left":
-                new_input_embeds_padded.append(torch.cat((torch.zeros((max_len - cur_len, cur_new_embed.shape[1]), dtype=cur_new_embed.dtype, device=cur_new_embed.device), cur_new_embed), dim=0))
+            embed_dtype = cur_new_embed.dtype
+            embed_device = cur_new_embed.device
+            zeros_tensor = torch.zeros((max_len - cur_len, cur_new_embed.shape[1]), dtype=embed_dtype, device=embed_device)
+            if padding_side == "left":
+                new_input_embeds_padded.append(torch.cat((zeros_tensor, cur_new_embed), dim=0))
                 if cur_len > 0:
                     new_labels_padded[i, -cur_len:] = cur_new_labels
                     attention_mask[i, -cur_len:] = True
                     position_ids[i, -cur_len:] = torch.arange(0, cur_len, dtype=position_ids.dtype, device=position_ids.device)
             else:
-                new_input_embeds_padded.append(torch.cat((cur_new_embed, torch.zeros((max_len - cur_len, cur_new_embed.shape[1]), dtype=cur_new_embed.dtype, device=cur_new_embed.device)), dim=0))
+                new_input_embeds_padded.append(torch.cat((cur_new_embed, zeros_tensor), dim=0))
                 if cur_len > 0:
                     new_labels_padded[i, :cur_len] = cur_new_labels
                     attention_mask[i, :cur_len] = True

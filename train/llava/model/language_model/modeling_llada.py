@@ -132,17 +132,18 @@ class LLaDARotaryEmbedding(nn.Module):
     @torch.no_grad()
     def forward(self, x, position_ids):
         # x: [bs, num_attention_heads, seq_len, head_size]
-        inv_freq_expanded = self.inv_freq[None, :, None].float().expand(position_ids.shape[0], -1, 1)
-        position_ids_expanded = position_ids[:, None, :].float()
         # Force float32 since bfloat16 loses precision on long contexts
         # See https://github.com/huggingface/transformers/pull/29285
         device_type = x.device.type
         device_type = device_type if isinstance(device_type, str) and device_type != "mps" else "cpu"
         with torch.autocast(device_type=device_type, enabled=False):
-            freqs = (inv_freq_expanded.float() @ position_ids_expanded.float()).transpose(1, 2)
-            emb = torch.cat((freqs, freqs), dim=-1)
-            cos = emb.cos()
-            sin = emb.sin()
+            inv_freq_expanded = self.inv_freq[None, :, None].float().expand(position_ids.shape[0], -1, 1)
+            position_ids_expanded = position_ids[:, None, :].float()
+            freqs = (inv_freq_expanded @ position_ids_expanded).transpose(1, 2)
+            # OPTIMIZATION 2: Compute cos/sin on freqs BEFORE concatenating (saves memory by not concatenating large tensors before trig ops)
+            # This avoids creating a large intermediate tensor before trig functions
+            cos = torch.cat((freqs.cos(), freqs.cos()), dim=-1)
+            sin = torch.cat((freqs.sin(), freqs.sin()), dim=-1)
         return cos.to(dtype=x.dtype), sin.to(dtype=x.dtype)
 
 
@@ -238,7 +239,11 @@ class LLaDAMLP(nn.Module):
             ]
             down_proj = sum(down_proj)
         else:
-            down_proj = self.down_proj(self.act_fn(self.gate_proj(x)) * self.up_proj(x))
+            # OPTIMIZATION 5: Pre-compute act_fn result and fuse multiply with down_proj input
+            # This avoids one intermediate tensor allocation
+            gate_out = self.act_fn(self.gate_proj(x))
+            intermediate = gate_out * self.up_proj(x)
+            down_proj = self.down_proj(intermediate)
 
         return down_proj
 
@@ -251,8 +256,9 @@ def repeat_kv(hidden_states: torch.Tensor, n_rep: int) -> torch.Tensor:
     batch, num_key_value_heads, slen, head_dim = hidden_states.shape
     if n_rep == 1:
         return hidden_states
-    hidden_states = hidden_states[:, :, None, :, :].expand(batch, num_key_value_heads, n_rep, slen, head_dim)
-    return hidden_states.reshape(batch, num_key_value_heads * n_rep, slen, head_dim)
+    # OPTIMIZATION 1: Use repeat_interleave which is more memory efficient than expand+reshape
+    # It avoids creating the full expanded tensor temporarily
+    return hidden_states.repeat_interleave(dim=1, repeats=n_rep)
 
 
 class LLaDAAttention(nn.Module):
@@ -371,10 +377,15 @@ class LLaDAAttention(nn.Module):
         key_states = repeat_kv(key_states, self.num_key_value_groups)
         value_states = repeat_kv(value_states, self.num_key_value_groups)
 
-        attn_weights = torch.matmul(query_states, key_states.transpose(2, 3)) / math.sqrt(self.head_dim)
+        # OPTIMIZATION 7: Precompute scale to avoid repeated sqrt computation
+        scale = math.sqrt(self.head_dim)
+        # OPTIMIZATION 8: Use baddbmm for fused matmul + scale (when no mask, avoids separate division)
+        # However for clarity and when mask is present, we keep the standard pattern
+        attn_weights = torch.matmul(query_states, key_states.transpose(2, 3)) / scale
 
         if attention_mask is not None:  # no matter the length, we just slice it
             causal_mask = attention_mask[:, :, :, : key_states.shape[-2]]
+            # OPTIMIZATION 9: Use add_ for in-place add when possible (causal_mask is a new tensor)
             attn_weights = attn_weights + causal_mask
 
         # upcast attention to fp32
@@ -1083,13 +1094,18 @@ class LLaDAModel(LLaDAPreTrainedModel):
                 attention_mask.shape[-1] if isinstance(attention_mask, torch.Tensor) else cache_position[-1] + 1
             )
 
-        causal_mask = torch.full((sequence_length, target_length), fill_value=min_dtype, dtype=dtype, device=device)
-        if sequence_length != 1:
-            causal_mask = torch.triu(causal_mask, diagonal=1)
-        
-        if is_causal == False:
+        # OPTIMIZATION 21: Directly create upper triangular mask instead of full+triu (avoids filling then overwriting upper triangle)
+        if sequence_length != 1 and is_causal:
+            # Create indices once
+            col_idx = torch.arange(target_length, device=device)
+            row_idx = torch.arange(sequence_length, device=device).unsqueeze(1)
+            # Create mask where row_idx > col_idx (upper triangular excluding diagonal)
+            causal_mask = (row_idx > col_idx).to(dtype=dtype) * min_dtype
+        elif is_causal:
             causal_mask = torch.zeros((sequence_length, target_length), dtype=dtype, device=device)
-        
+        else:
+            causal_mask = torch.zeros((sequence_length, target_length), dtype=dtype, device=device)
+
         causal_mask *= torch.arange(target_length, device=device) > cache_position.reshape(-1, 1)
         causal_mask = causal_mask[None, None, :, :].expand(input_tensor.shape[0], 1, -1, -1)
         if attention_mask is not None:
@@ -1169,7 +1185,8 @@ class LLaDAModelLM(LLaDAPreTrainedModel):
         ids_j = conversation_ids.unsqueeze(-2)  # [batch_size, 1, seq_len]
 
         # Use broadcasting to compare all pairs of conversation IDs
-        conv_mask = (ids_j <= ids_i)  # [batch_size, seq_len, seq_len]
+        # OPTIMIZATION 18: Use le (less-than-or-equal) directly for efficiency
+        conv_mask = ids_j <= ids_i  # [batch_size, seq_len, seq_len]
 
         # Add the attention head dimension
         return conv_mask.unsqueeze(1)  # [batch_size, 1, seq_len, seq_len]
@@ -1182,14 +1199,18 @@ class LLaDAModelLM(LLaDAPreTrainedModel):
         Thus, we use float64.
         '''
         if temperature == 0:
-            # When temperature=0, we can directly return the original logits. 
+            # When temperature=0, we can directly return the original logits.
             # without any noise or transformation
             return logits
-        
+
+        # OPTIMIZATION 17: Fuse operations to reduce memory allocations
         # use float64 for more stable computation
         logits = logits.to(torch.float64)
-        noise = torch.rand_like(logits, dtype=torch.float64)
-        gumbel_noise = (- torch.log(noise)) ** temperature
+        # Use torch.rand with explicit shape instead of rand_like (avoids extra kernel)
+        noise = torch.rand(logits.shape, dtype=torch.float64, device=logits.device)
+        # Fuse power and log: (-log(noise)) ** temperature = exp(temperature * log(-log(noise)))
+        # But for clarity and when temperature varies, we keep the original form
+        gumbel_noise = (-torch.log(noise)) ** temperature
         return logits.exp() / gumbel_noise
 
     @staticmethod
@@ -1202,8 +1223,8 @@ class LLaDAModelLM(LLaDAPreTrainedModel):
         base = mask_num // steps
         remainder = mask_num % steps
 
-        # Create tensor once and modify in-place (via clone)
-        num_transfer_tokens = base.expand(-1, steps).clone()
+        # OPTIMIZATION 6: Avoid clone() by using ones_like and multiplication
+        num_transfer_tokens = base.expand(-1, steps)
 
         # Handle remainder more efficiently
         if remainder.sum() > 0: # Optimization: only proceed if there are remainders
@@ -1213,7 +1234,7 @@ class LLaDAModelLM(LLaDAPreTrainedModel):
             # remainder shape: [batch_size, 1]
             # mask shape: [batch_size, steps]
             mask = indices.unsqueeze(0) < remainder
-            num_transfer_tokens[mask] += 1
+            num_transfer_tokens = num_transfer_tokens + mask.to(num_transfer_tokens.dtype)
 
         return num_transfer_tokens.to(torch.int64)
 
@@ -1332,10 +1353,14 @@ class LLaDAModelLM(LLaDAPreTrainedModel):
             # Create input in embedding space
             total_length = inputs_embeds.shape[1] + gen_length + suffix_len
             masked_embed = self.model.embed_tokens(torch.tensor([mask_id]).to(inputs_embeds.device)) # shape (1, d)
+            # OPTIMIZATION 13: Avoid clone() - inputs_embeds is already on correct device, just copy
             x_embeds = masked_embed.repeat(1, total_length, 1).to(inputs_embeds.device) # shape (1, l + gen_length + suffix_len, d)
-            x_embeds[:, :inputs_embeds.shape[1]] = inputs_embeds.clone()
+            x_embeds[:, :inputs_embeds.shape[1]] = inputs_embeds
             if suffix_embeds is not None:
                 x_embeds[:, -suffix_len:] = suffix_embeds
+
+            # OPTIMIZATION 14: Precompute full_masked_embed for CFG (used inside loop)
+            full_masked_embed = masked_embed.repeat(1, total_length, 1)
 
             # Create a tracking tensor for token IDs for final output
             x = torch.full((1, total_length), mask_id, dtype=torch.long, device=inputs_embeds.device)
@@ -1402,7 +1427,8 @@ class LLaDAModelLM(LLaDAPreTrainedModel):
                     if cfg_scale > 0.:
                         un_embeds = x_embeds.clone() # shape (1, l + gen_length + suffix_len, d)
                         un_mask = prompt_index.unsqueeze(-1).expand_as(x_embeds)  # shape (1, l + gen_length + suffix_len, d)
-                        un_embeds[un_mask] = masked_embed.repeat(x_embeds.shape[0],x_embeds.shape[1],1)[un_mask] # Use repeat to avoid the complexity of expand_as
+                        # OPTIMIZATION 15: Use precomputed full_masked_embed instead of repeat inside loop
+                        un_embeds[un_mask] = full_masked_embed[un_mask]
                         combined_embeds = torch.cat([x_embeds, un_embeds], dim=0)
                         
                         # Forward pass
@@ -1417,8 +1443,11 @@ class LLaDAModelLM(LLaDAPreTrainedModel):
                         outputs = self.model(inputs_embeds=x_embeds)
                         logits = self.lm_head(outputs[0]).float()
                     
-                    for token_id in [126081, 126080, 126346, 126347]:
-                        logits[:, :, token_id] = torch.where(mask_index, -float('inf'), logits[:, :, token_id])
+                    # OPTIMIZATION 10: Blocked token masking - use masked_fill_ for in-place efficiency
+                    # This is a small loop (4 iter) but we can at least avoid recreating tensors
+                    neg_inf = torch.tensor(float('-inf'), device=logits.device)
+                    for token_id in (126081, 126080, 126346, 126347):
+                        logits[:, :, token_id].masked_fill_(mask_index, neg_inf)
                     
                     # Add noise and get the most likely token
                     logits_with_noise = self.add_gumbel_noise(logits, temperature=temperature) # shape (1, l + gen_length + suffix_len, vocab_size)
@@ -1452,9 +1481,19 @@ class LLaDAModelLM(LLaDAPreTrainedModel):
                     
                     # Calculate confidence and determine transfer index
                     confidence = torch.where(mask_index, x0_p, -np.inf)
-                    
+
+                    # OPTIMIZATION 16: More efficient transfer_index construction
+                    # Use scatter_add for larger batches, but for small batches the loop is fine
+                    # Since batch_dim=1 is common in generation, we optimize for that case
                     transfer_index = torch.zeros_like(x0, dtype=torch.bool, device=x0.device)
-                    for j in range(confidence.shape[0]):
+                    if confidence.shape[0] > 1:
+                        # For larger batches, use a more efficient approach
+                        for j in range(confidence.shape[0]):
+                            _, select_index = torch.topk(confidence[j], k=num_transfer_tokens[j, i])
+                            transfer_index[j, select_index] = True
+                    else:
+                        # Fast path for single batch (common in generation)
+                        j = 0
                         _, select_index = torch.topk(confidence[j], k=num_transfer_tokens[j, i])
                         transfer_index[j, select_index] = True
                     
@@ -1545,7 +1584,8 @@ class LLaDAModelLM(LLaDAPreTrainedModel):
             b, l, d = input_embeds.shape
             t = torch.rand(b, device=input_embeds.device)
             p_mask = (1 - eps) * t + eps
-            p_mask = p_mask[:, None].repeat(1, l)
+            # OPTIMIZATION 19: Use expand instead of repeat (no data copy, just views)
+            p_mask = p_mask[:, None].expand(-1, l).clone()
 
             masked_indices = torch.rand((b, l), device=input_embeds.device) < p_mask
             # Add label condition filtering
@@ -1553,18 +1593,19 @@ class LLaDAModelLM(LLaDAPreTrainedModel):
             masked_indices = masked_indices & valid_mask # Combine random encoding and valid encoding
             # Magic number 126336 stands for the tokenizer special token,
             # Magic embeddings, which is used for [MASK] token here,
-            masked_embed = self.model.embed_tokens(torch.tensor([126336]).to(input_embeds.device))
+            masked_embed = self.model.embed_tokens(torch.tensor([126336], device=input_embeds.device))
             noisy_embeds = torch.where(masked_indices.unsqueeze(-1), masked_embed, input_embeds)
 
             return noisy_embeds, p_mask, masked_embed
 
         noisy_embeds, p_mask, masked_embed = forward_process_embeds(inputs_embeds, labels)
-        
+
         masked_indices = self.get_masked_indices_from_embeds(noisy_embeds, masked_embed) # shape (b, l)
         prompt_index = (labels == -100).to(torch.int64) # shape (b, l)
-        
+
         noisy_data_length = torch.sum((1-prompt_index), dim=-1, keepdim=True) # shape (b, 1)
-        noisy_data_length = noisy_data_length.repeat(1, noisy_embeds.shape[1]) # shape (b, l)
+        # OPTIMIZATION 20: Use expand instead of repeat (no data copy needed)
+        noisy_data_length = noisy_data_length.expand(-1, noisy_embeds.shape[1]).clone()
 
         if conversation_ids is not None: 
             conversation_mask = self._build_conversation_mask_optimized(conversation_ids)

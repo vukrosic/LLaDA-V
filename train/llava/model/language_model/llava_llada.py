@@ -13,17 +13,12 @@
 #    limitations under the License.
 
 
-from typing import List, Optional, Tuple, Union, Dict
+from typing import List, Optional, Tuple, Union
 
 import torch
 import torch.nn as nn
 
-import transformers
-from transformers import AutoConfig, AutoModelForCausalLM, LlamaConfig, LlamaModel, LlamaForCausalLM
-
-
-from torch.nn import CrossEntropyLoss
-
+from transformers import AutoConfig, AutoModelForCausalLM
 from transformers.modeling_outputs import CausalLMOutputWithPast
 from transformers.generation.utils import GenerateOutput
 
@@ -45,7 +40,7 @@ class LlavaLLaDAModel(LlavaMetaModel, LLaDAModel):
     config_class = LlavaLLaDAConfig
 
     def __init__(self, config: LLaDAConfig):
-        super(LlavaLLaDAModel, self).__init__(config)
+        super().__init__(config)
 
 
 class LlavaLLaDAModelLM(LLaDAModelLM, LlavaMetaForCausalLM):
@@ -85,43 +80,31 @@ class LlavaLLaDAModelLM(LLaDAModelLM, LlavaMetaForCausalLM):
         cache_position=None,
     ) -> Union[Tuple, CausalLMOutputWithPast]:
 
-        if inputs_embeds is None and attention_mask is not None:
-            # donate multi-dialogue 
-            (input_ids, position_ids, attention_mask, past_key_values, inputs_embeds, labels, conversation_ids) = self.prepare_inputs_labels_for_multimodal(input_ids, position_ids, attention_mask, past_key_values, labels, images, modalities, image_sizes, is_llada=True)
-        elif inputs_embeds is None:
-            (input_ids, position_ids, attention_mask, past_key_values, inputs_embeds, labels) = self.prepare_inputs_labels_for_multimodal(input_ids, position_ids, attention_mask, past_key_values, labels, images, modalities, image_sizes)
-            conversation_ids = None
+        conversation_ids = None
+        if inputs_embeds is None:
+            if attention_mask is not None:
+                # donate multi-dialogue
+                (input_ids, position_ids, attention_mask, past_key_values, inputs_embeds, labels, conversation_ids) = self.prepare_inputs_labels_for_multimodal(input_ids, position_ids, attention_mask, past_key_values, labels, images, modalities, image_sizes, is_llada=True)
+            else:
+                (input_ids, position_ids, attention_mask, past_key_values, inputs_embeds, labels) = self.prepare_inputs_labels_for_multimodal(input_ids, position_ids, attention_mask, past_key_values, labels, images, modalities, image_sizes)
+        common_kwargs = dict(
+            input_ids=input_ids,
+            attention_mask=attention_mask,
+            position_ids=position_ids,
+            past_key_values=past_key_values,
+            inputs_embeds=inputs_embeds,
+            use_cache=use_cache,
+            output_attentions=output_attentions,
+            output_hidden_states=output_hidden_states,
+            return_dict=return_dict,
+        )
+        model = self.model
         if dpo_forward:
-            outputs = self.model(
-                input_ids=input_ids,
-                attention_mask=attention_mask,
-                position_ids=position_ids,
-                past_key_values=past_key_values,
-                inputs_embeds=inputs_embeds,
-                use_cache=use_cache,
-                output_attentions=output_attentions,
-                output_hidden_states=output_hidden_states,
-                return_dict=return_dict,
-            )
-
-            hidden_states = outputs[0]
-            logits = self.lm_head(hidden_states)
+            outputs = model(**common_kwargs)
+            logits = self.lm_head(outputs[0])
             return logits, labels
-
         else:
-            return super().forward(
-                input_ids=input_ids,
-                attention_mask=attention_mask,
-                position_ids=position_ids,
-                past_key_values=past_key_values,
-                inputs_embeds=inputs_embeds,
-                labels=labels,
-                use_cache=use_cache,
-                output_attentions=output_attentions,
-                output_hidden_states=output_hidden_states,
-                return_dict=return_dict,
-                conversation_ids=conversation_ids,
-            )
+            return super().forward(**common_kwargs, labels=labels, conversation_ids=conversation_ids)
 
     @torch.no_grad()
     def generate(
@@ -132,16 +115,17 @@ class LlavaLLaDAModelLM(LLaDAModelLM, LlavaMetaForCausalLM):
         modalities: Optional[List[str]] = ["image"],
         **kwargs,
     ) -> Union[GenerateOutput, torch.LongTensor]:
-        modalities = kwargs.pop("modalities", None) if "modalities" in kwargs and modalities is None else modalities
+        modalities = kwargs.pop("modalities", modalities)
         position_ids = kwargs.pop("position_ids", None)
         attention_mask = kwargs.pop("attention_mask", None)
-        if "inputs_embeds" in kwargs:
+        if kwargs.get("inputs_embeds") is not None:
             raise NotImplementedError("`inputs_embeds` is not supported")
 
         if images is not None:
             (inputs, position_ids, attention_mask, _, inputs_embeds, _) = self.prepare_inputs_labels_for_multimodal(inputs, position_ids, attention_mask, None, None, images, modalities, image_sizes=image_sizes)
         else:
-            inputs_embeds = self.get_model().embed_tokens(inputs)
+            model = self.get_model()
+            inputs_embeds = model.embed_tokens(inputs)
 
         return super().generate_with_embeds(inputs_embeds=inputs_embeds, **kwargs)
 
@@ -149,10 +133,8 @@ class LlavaLLaDAModelLM(LLaDAModelLM, LlavaMetaForCausalLM):
         images = kwargs.pop("images", None)
         image_sizes = kwargs.pop("image_sizes", None)
         inputs = super().prepare_inputs_for_generation(input_ids, past_key_values=past_key_values, inputs_embeds=inputs_embeds, **kwargs)
-        if images is not None:
-            inputs["images"] = images
-        if image_sizes is not None:
-            inputs["image_sizes"] = image_sizes
+        extra_inputs = {k: v for k, v in (("images", images), ("image_sizes", image_sizes)) if v is not None}
+        inputs.update(extra_inputs)
         return inputs
 
 

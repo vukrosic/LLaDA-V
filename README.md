@@ -1,7 +1,67 @@
-# LLaDA-V: Large Language Diffusion Models with Visual Instruction Tuning
+# LLaDA-V: Kernel-Optimized Fork
+
 [![arXiv](https://img.shields.io/badge/Paper-arXiv-red.svg)](https://arxiv.org/abs/2505.16933)
 [![deploy](https://img.shields.io/badge/Hugging%20Face-LLaDA_V-FFEB3B)](https://huggingface.co/GSAI-ML/LLaDA-V)
 
+> **This is a fork of [ML-GSAI/LLaDA-V](https://github.com/ML-GSAI/LLaDA-V)** focused on GPU kernel optimization and inference performance analysis. The original LLaDA-V is a diffusion-based vision-language model; this fork keeps all original functionality and adds optimized kernel implementations with reproducible benchmarks.
+
+---
+
+## What This Fork Adds
+
+This fork systematically benchmarks and optimizes the PyTorch eager-mode kernels used during LLaDA-V's diffusion inference loop. All optimizations are pure PyTorch (no custom CUDA/Triton) and focus on reducing memory traffic, eliminating redundant computation, and vectorizing Python loops.
+
+### Key Results
+
+| Optimization | Speedup | What Changed |
+|---|---|---|
+| confidence_gather | **14-60x** | Skip unnecessary softmax when only ranking matters |
+| transfer_mask | **5x** | Replace Python loop with vectorized `scatter_` |
+| topk_variants | **4.6x** | Use `torch.topk` instead of full `argsort` + slice |
+| logits_postproc | **4.5x** | `argmax(softmax(x))` = `argmax(x)`, skip the softmax |
+| stop_detect | **2.3x** | Vectorize nested Python loops with `torch.isin` |
+| attention_score | **1.83x** | Scale Q (small) before matmul instead of scores (large) after |
+| get_num_transfer_tokens | **1.73-1.77x** | Out-of-place `+` instead of `.clone()` + in-place `+=` |
+| repeat_kv | **1.12-1.31x** | `repeat_interleave` instead of `expand` + `reshape` |
+
+Overall kernel-level speedup: **~1.05x (Round 1)**, **~2.16x (Round 2)**. Estimated end-to-end inference improvement: **5-10%** (most runtime is memory-bandwidth-bound weight loading and Flash Attention).
+
+### What We Learned
+
+The biggest wins didn't come from doing the same work faster -- they came from **not doing unnecessary work** (skipping softmax when only the argmax or ranking is needed). Traditional kernel-level tricks (in-place ops, dtype changes, manual softmax) showed little to no improvement because PyTorch's built-in kernels are already well-optimized.
+
+For the full analysis with code, explanations, and benchmark methodology, see the **[Kernel Optimization Blog](KERNEL_BLOG.md)**.
+
+### Benchmark Files
+
+```
+train/kernels/
+  master_benchmark.py     # Round 1: 10 kernel categories (attention, RoPE, RMSNorm, etc.)
+  attention_score.py      # 5 attention variants with standalone verification
+  rmsnorm.py, softmax.py  # Individual kernel benchmarks
+  ...
+
+train/kernels_v2/
+  more_kernels.py         # Round 2: 10 more categories (~90 variant benchmarks)
+```
+
+Run them yourself:
+```bash
+python3 train/kernels/master_benchmark.py    # Round 1
+python3 train/kernels_v2/more_kernels.py     # Round 2
+```
+
+All benchmarks run on an RTX 3090 (24GB), CUDA 12.1, PyTorch 2.5.1.
+
+---
+
+## Original LLaDA-V
+
+Everything below is from the [original repository](https://github.com/ML-GSAI/LLaDA-V).
+
+---
+
+# LLaDA-V: Large Language Diffusion Models with Visual Instruction Tuning
 
 ## News
 - [2026.03.23] We are excited to introduce [LLaDA-o](https://huggingface.co/GSAI-ML/LLaDA-o), the latest model in the LLaDA series. As an effective and length-adaptive omni diffusion model for unified multimodal understanding and generation, LLaDA-o extends the LLaDA line to broader multimodal settings, supporting visual understanding, text-to-image generation, and instruction-based image editing. For more details, please check out the [paper](https://huggingface.co/papers/2603.01068) and [code](https://github.com/ML-GSAI/LLaDA-o).

@@ -265,7 +265,8 @@ for (B, H, L) in [(1, 32, 512), (4, 32, 512), (1, 64, 1024)]:
     x = torch.randn(B, H, L, L, device=device)
 
     t_stable = benchmark(softmax_stable, (x,))
-    t_inplace = benchmark(softmax_inplace, (x,))
+    # softmax_inplace modifies x in-place, so pass a fresh clone each iteration
+    t_inplace = benchmark(lambda x=x: softmax_inplace(x.clone()), ())
     print(f"  softmax B={B},H={H},L={L}: stable={t_stable:.4f}ms, inplace={t_inplace:.4f}ms, {t_stable/t_inplace:.2f}x")
     results.append(("softmax", f"B={B},H={H}", t_stable, t_inplace, t_stable/t_inplace))
 

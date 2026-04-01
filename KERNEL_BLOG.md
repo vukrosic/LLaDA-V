@@ -1,7 +1,6 @@
-# LLaDA-V Kernel Optimization: A Practical Tutorial
-## How We Achieved 1.88x Speedup on Attention (And What We Learned Along the Way)
+# LLaDA-V: 1.83x Speedup on Attention (And Other Optimizations)
 
-Vuk Rosić
+Vuk Rosić | [GitHub Repo](https://github.com/vukrosic/LLaDA-V)
 
 ---
 
@@ -14,7 +13,7 @@ Vuk Rosić
    - [1. attention_score: The Power of Fused Operations](#1-attention_score-the-power-of-fused-operations)
    - [2. repeat_kv: Views vs Copies](#2-repeat_kv-views-vs-copies)
    - [3. get_num_transfer_tokens: Avoiding Unnecessary Allocations](#3-get_num_transfer_tokens-avoiding-unnecessary-allocations)
-5. [Round 2: 100 More Kernels](#round-2-100-more-kernels)
+5. [Round 2: More Kernel Categories](#round-2-more-kernel-categories)
 6. [What Didn't Work (And Why)](#what-didnt-work-and-why)
 7. [The Real Bottleneck](#the-real-bottleneck)
 8. [How to Run the Benchmarks](#how-to-run-the-benchmarks)
@@ -30,9 +29,9 @@ We'll cover real benchmark results from an RTX 3090, including some optimization
 
 **Prerequisites**: Basic PyTorch, familiarity with tensors and GPU computing.
 
-> **Note**: We aren't writing custom CUDA/Triton kernels here. We are optimizing how **PyTorch Eager Mode** dispatches operations — arranging native PyTorch calls to minimize memory allocations and kernel dispatch overhead.
+> **Note**: We aren't writing custom CUDA/Triton kernels here. We are optimizing how **PyTorch Eager Mode** dispatches operations - arranging native PyTorch calls to minimize memory allocations and kernel dispatch overhead.
 
-> **Amdahl's Law reminder**: A 2x speedup on a kernel that takes 10% of runtime = only 10% overall speedup. We'll see this in action — the kernels we optimize are fast, but they weren't the bottleneck to begin with.
+> **Amdahl's Law reminder**: A 2x speedup on a kernel that takes 10% of runtime = only 10% overall speedup. We'll see this in action - the kernels we optimize are fast, but they weren't the bottleneck to begin with.
 
 ---
 
@@ -65,7 +64,7 @@ Each step involves:
 
 ## Understanding Kernel Benchmarks
 
-A "kernel" in GPU computing is a single function that runs on the GPU. Here, we aren't writing custom CUDA kernels — we use PyTorch Eager Mode operations, each of which dispatches to a pre-compiled kernel (cuBLAS for matmul, etc.). When we "optimize kernels," we mean choosing and ordering those PyTorch operations better.
+A "kernel" in GPU computing is a single function that runs on the GPU. Here, we aren't writing custom CUDA kernels - we use PyTorch Eager Mode operations, each of which dispatches to a pre-compiled kernel (cuBLAS for matmul, etc.). When we "optimize kernels," we mean choosing and ordering those PyTorch operations better.
 
 **How we benchmark** (using PyTorch's CUDA events):
 
@@ -101,7 +100,7 @@ def benchmark(fn, n_iters=500, warmup=50):
 speedup = baseline_time / optimized_time
 ```
 - speedup > 1.0 means optimized is faster
-- speedup = 1.88x means 88% faster
+- speedup = 1.83x means 83% faster
 
 ---
 
@@ -114,13 +113,13 @@ speedup = baseline_time / optimized_time
 > **Note on Flash Attention**: LLaDA-V uses Flash Attention for its main attention computation, which is already fused and IO-optimal. This optimization is relevant for:
 > - **Fallback paths** when Flash Attention can't be used (e.g., certain input shapes)
 > - **Non-standard attention steps** in LLaDA's diffusion process that differ from standard self-attention
-> - **Educational purposes** — the principle of "scale the smaller tensor before matmul" applies broadly
+> - **Educational purposes** - the principle of "scale the smaller tensor before matmul" applies broadly
 >
-> See [Section 7](#the-real-bottleneck) for why the overall impact is limited despite the 1.88x kernel speedup.
+> See [Section 7](#the-real-bottleneck) for why the overall impact is limited despite the 1.83x kernel speedup.
 
 #### The Baseline (Slow)
 
-**Math**: `Scores = (Q @ K^T) / √d` — Q: **(B, H, L, D)**, K: **(B, H, L, D)**, Scores: **(B, H, L, L)**
+**Math**: `Scores = (Q @ K^T) / √d` - Q: **(B, H, L, D)**, K: **(B, H, L, D)**, Scores: **(B, H, L, L)**
 
 ```python
 def attention_baseline(q, k, scale):
@@ -139,7 +138,7 @@ def attention_baseline(q, k, scale):
 
 ```python
 def attention_optimized(q, k, scale):
-    # Multiply Q by scale first — q_scaled is a small (B,H,L,D) tensor
+    # Multiply Q by scale first - q_scaled is a small (B,H,L,D) tensor
     q_scaled = q * scale
 
     # Now single matmul does everything
@@ -162,13 +161,13 @@ The key insight: **scaling Q (small) before the matmul avoids materializing the 
 
 | Config | Baseline | Optimized | Speedup |
 |--------|----------|-----------|---------|
-| B=1, H=64, L=1024 | 1.13ms | 0.60ms | **1.88x** |
-| B=4, H=32, L=512 | 0.58ms | 0.33ms | **1.75x** |
+| B=1, H=64, L=1024 | 1.17ms | 0.64ms | **1.83x** |
+| B=4, H=32, L=512 | 0.59ms | 0.34ms | **1.72x** |
 
 #### Verification
 
 ```python
-# ⚠️ NOT bit-identical — see note below
+# ⚠️ NOT bit-identical - see note below
 q, k = torch.randn(1, 64, 1024, 64), torch.randn(1, 64, 1024, 64)
 scale = 1.0 / math.sqrt(64)
 
@@ -179,7 +178,7 @@ assert torch.allclose(result_baseline, result_optimized, rtol=1e-4, atol=1e-5), 
 # ✓ Numerically equivalent (within FP tolerance)
 ```
 
-> **Why not bit-identical?** Floating-point arithmetic is not associative. `(Q @ K^T) × scale` and `(Q × scale) @ K^T` differ in the order of multiply-add operations due to hardware rounding limits. Different intermediate values accumulate different rounding errors. This is normal and not a correctness problem — the outputs are within FP32 tolerance.
+> **Why not bit-identical?** Floating-point arithmetic is not associative. `(Q @ K^T) × scale` and `(Q × scale) @ K^T` differ in the order of multiply-add operations due to hardware rounding limits. Different intermediate values accumulate different rounding errors. This is normal and not a correctness problem - the outputs are within FP32 tolerance.
 
 ---
 
@@ -206,7 +205,7 @@ def repeat_kv_baseline(hidden_states, n_rep):
     return hidden_states.reshape(batch, num_kv_heads * n_rep, slen, head_dim)
 ```
 
-**Problem**: `expand()` is lazy — it creates a view with **stride 0** in the repeated dimension (same physical data is reused). `reshape()` must produce a contiguous tensor as output, so with stride-0 it **always copies** — there's no way around it.
+**Problem**: `expand()` is lazy - it creates a view with **stride 0** in the repeated dimension (same physical data is reused). `reshape()` must produce a contiguous tensor as output, so with stride-0 it **always copies** - there's no way around it.
 
 #### The Optimized Version
 
@@ -219,7 +218,7 @@ def repeat_kv_optimized(hidden_states, n_rep):
 
 **Why it's faster**: Both versions launch one GPU kernel. The difference is *how* that kernel handles memory:
 
-- `expand()` creates a view with **stride 0** — the same input data is read multiple times with stride 0 in the repeated dimension.
+- `expand()` creates a view with **stride 0** - the same input data is read multiple times with stride 0 in the repeated dimension.
 - When `reshape()` makes the result contiguous, it must handle this awkward stride-0 access pattern, which defeats memory coalescing and often results in a non-optimal memory copy.
 - `repeat_interleave` tiles the data contiguously from the start, with no stride-0 gymnastics. The memory access is predictable and GPU-friendly.
 
@@ -256,8 +255,8 @@ Optimized approach:
 
 | Config | Baseline | Optimized | Speedup |
 |--------|----------|-----------|---------|
-| B=1, L=1024 | 0.11ms | 0.07ms | **1.58x** |
-| B=4, L=512 | 0.10ms | 0.06ms | **1.49x** |
+| B=1, H=8, L=1024 | 0.033ms | 0.025ms | **1.31x** |
+| B=4, H=8, L=512 | 0.032ms | 0.029ms | **1.12x** |
 
 #### Verification
 
@@ -297,7 +296,7 @@ def get_num_transfer_baseline(mask_index, steps):
     remainder = mask_num % steps   # Extra tokens for first few steps
 
     # expand() creates a VIEW with broadcasted (not copied) data.
-    # You CAN'T safely do in-place += on it — the broadcast semantics
+    # You CAN'T safely do in-place += on it - the broadcast semantics
     # mean writing to it would corrupt the expanded view's behavior.
     # So we MUST clone() to get a real tensor we can modify. Expensive!
     num_transfer_tokens = base.expand(-1, steps).clone()
@@ -344,8 +343,8 @@ def get_num_transfer_optimized(mask_index, steps):
 
 | Config | Baseline | Optimized | Speedup |
 |--------|----------|-----------|---------|
-| B=1, L=512 | 0.70ms | 0.43ms | **1.62x** |
-| B=4, L=512 | 0.70ms | 0.43ms | **1.62x** |
+| B=1, L=512 | 0.38ms | 0.22ms | **1.73x** |
+| B=4, L=512 | 0.38ms | 0.22ms | **1.77x** |
 
 #### Verification
 
@@ -362,15 +361,58 @@ assert torch.allclose(result_baseline.float(), result_optimized.float()), "Resul
 
 ---
 
-## Round 2: 100 More Kernels
+## Round 2: More Kernel Categories
 
-> **⚠️ Important**: Round 2 benchmarks measure isolated kernels. The speedup numbers (3.6x, 4x, etc.) represent single-kernel improvements only and may not translate to end-to-end inference gains. The overall "kernel-level speedup" of 1.05x across all tested kernels gives a more realistic picture.
+> **⚠️ Important**: Round 2 benchmarks measure isolated kernels. The speedup numbers (4.6x, 5x, etc.) represent single-kernel improvements only and may not translate to end-to-end inference gains. Some wins (like confidence_gather) come from skipping unnecessary computation entirely, which does translate to real speedups when the baseline was doing redundant work.
 
-We tested 100 additional kernel variants across 10 new categories. Most didn't show improvement, but a few did:
+We tested ~90 kernel variant benchmarks across 10 new categories (27 benchmark configurations). Many didn't show improvement, but several did:
 
 ### Legitimate Wins
 
-#### topk_variants: 3.6x speedup
+#### confidence_gather: 14–60x speedup
+
+**Baseline** (softmax + gather):
+```python
+def confidence_baseline(logits, x0):
+    p = F.softmax(logits.float(), dim=-1)
+    return torch.gather(p, -1, x0.unsqueeze(-1)).squeeze(-1)
+```
+
+**Optimized** (gather raw logits):
+```python
+def confidence_gather(logits, x0):
+    return torch.gather(logits, -1, x0.unsqueeze(-1)).squeeze(-1)
+```
+
+**Why it works**: If you only need the confidence at specific token positions (not the full probability distribution), skip the expensive softmax over the entire vocabulary. `gather` on raw logits is sufficient for ranking/comparison purposes since softmax is monotonic.
+
+```python
+# Verification (ranking equivalence)
+logits = torch.randn(4, 512, 32000, device=device)
+x0 = torch.randint(0, 32000, (4, 512), device=device)
+raw = torch.gather(logits, -1, x0.unsqueeze(-1)).squeeze(-1)
+soft = torch.gather(F.softmax(logits.float(), dim=-1), -1, x0.unsqueeze(-1)).squeeze(-1)
+# Rankings are preserved: higher raw logit = higher softmax probability
+```
+
+#### logits_postproc: 4.5x speedup
+
+**Baseline** (softmax + argmax):
+```python
+def logits_baseline(logits):
+    p = F.softmax(logits, dim=-1)
+    return torch.argmax(p, dim=-1)
+```
+
+**Optimized** (direct argmax):
+```python
+def logits_direct(logits):
+    return torch.argmax(logits, dim=-1)
+```
+
+**Why it works**: `argmax(softmax(x))` ≡ `argmax(x)` because softmax is a monotonic transformation - it preserves the ordering. The softmax computation is entirely wasted if you only need the index of the maximum.
+
+#### topk_variants: 4.6x speedup
 
 **Baseline** (argsort + slice):
 ```python
@@ -405,7 +447,7 @@ assert torch.allclose(topk_vals_baseline, topk_vals_opt), "Top-k values must mat
 # ✓ Results have identical top-k values
 ```
 
-#### transfer_mask: 4x speedup
+#### transfer_mask: 5x speedup
 
 **Baseline** (Python loop with per-batch topk):
 ```python
@@ -439,7 +481,7 @@ assert torch.equal(result_baseline, result_optimized), "Transfer masks must matc
 # ✓ Bit-identical
 ```
 
-#### stop_detect: 2x speedup
+#### stop_detect: 2.3x speedup
 
 **Baseline** (Nested Python loops):
 ```python
@@ -482,7 +524,7 @@ assert result_baseline == result_optimized, "Stop detection must match!"
 
 ## What Didn't Work (And Why)
 
-### 1. topk_vectorized (0.82x - slower!)
+### 1. topk_vectorized (0.83–0.94x - slower!)
 
 We tried batching the Python loop by extracting `torch.topk` but still iterating over batch elements:
 ```python
@@ -492,9 +534,9 @@ def topk_vectorized(confidence, k):
         transfer_index[j, topk_indices[j, :k[j]]] = True
 ```
 
-**Why it failed**: The Python `for` loop over batch elements still exists. Even though we use `torch.topk` (which is itself a 3.6x win over `argsort+slice`), the loop overhead in Python dominates.
+**Why it failed**: The Python `for` loop over batch elements still exists. Even though we use `torch.topk` (which is itself a 4.6x win over `argsort+slice`), the loop overhead in Python dominates.
 
-> **Note**: `torch.topk` itself is a legitimate 3.6x win when compared fairly against `argsort + slice`. The 0.82x regression is specifically about the "vectorized loop" variant. See Round 2 results below.
+> **Note**: `torch.topk` itself is a legitimate 4.6x win when compared fairly against `argsort + slice`. The 0.83–0.94x regression is specifically about the "vectorized loop" variant. See Round 2 results below.
 
 ### 2. gumbel_half (1.0x - no gain)
 
@@ -505,11 +547,11 @@ noise = torch.rand(logits.shape, dtype=torch.float32, device=logits.device)
 
 **Why it failed**: Two reasons:
 
-1. **Memory-bandwidth bound, not compute-bound**: Generating random noise is dominated by memory operations — writing the noise tensor to HBM takes far more time than the FP32/FP64 arithmetic. Any theoretical compute advantage of FP32 over FP64 is completely hidden behind the memory wall.
+1. **Memory-bandwidth bound, not compute-bound**: Generating random noise is dominated by memory operations - writing the noise tensor to HBM takes far more time than the FP32/FP64 arithmetic. Any theoretical compute advantage of FP32 over FP64 is completely hidden behind the memory wall.
 
 2. **Conversion overhead**: Even though we generate FP32 noise, we still convert to FP64 for the Gumbel computation (`(-torch.log(noise)) ** temperature`), so we pay the conversion cost anyway.
 
-Note: On the RTX 3090 (Ampere), FP64 is also intentionally throttled to 1/64th of FP32 throughput — but this doesn't matter here since compute isn't the bottleneck.
+Note: On the RTX 3090 (Ampere), FP64 is also intentionally throttled to 1/64th of FP32 throughput - but this doesn't matter here since compute isn't the bottleneck.
 
 ### 3. softmax_inplace (1.0x - no gain)
 
@@ -523,30 +565,32 @@ def softmax_inplace(x, dim=-1):
 
 **Why it failed**: PyTorch's `softmax` is already a highly optimized fused kernel. Our "in-place" version actually required multiple kernel launches, while PyTorch's version does it in one.
 
-### 4. rmsnorm_method (artificial speedup — ⚠️ correctness bug!)
+### 4. rmsnorm_method (artificial speedup - ⚠️ correctness bug!)
 
 We tried replacing `torch.rsqrt(variance + eps)` with the tensor method `variance.rsqrt()`:
 ```python
 # Baseline
 x_norm = x * torch.rsqrt(variance + eps)
 
-# "Optimized" — DROPS eps! Bug!
+# "Optimized" - DROPS eps! Bug!
 x_norm = x * variance.rsqrt()
 ```
 
-**Why it's wrong**: `variance.rsqrt()` computes `1/√variance`, but the mathematically correct RMSNorm uses `1/√(variance + eps)` to prevent division by zero. For typical activations with variance ~1.0, the difference is tiny (~1e-6). But for small variances (e.g., near-zero inputs), dropping eps causes numerical instability — NaN or Inf in the output.
+**Why it's wrong**: `variance.rsqrt()` computes `1/√variance`, but the mathematically correct RMSNorm uses `1/√(variance + eps)` to prevent division by zero. For typical activations with variance ~1.0, the difference is tiny (~1e-6). But for small variances (e.g., near-zero inputs), dropping eps causes numerical instability - NaN or Inf in the output.
 
-**Why the speedup was artificial**: The 1.26x "win" came entirely from dropping the `variance + eps` addition, not from any real optimization:
+**Why the speedup was artificial**: Any small "win" came entirely from dropping the `variance + eps` addition, not from any real optimization:
 
-| Version | Time |
+| Version | Time (B=1, L=512, D=4096) |
 |---------|------|
-| `torch.rsqrt(variance + eps)` | 0.21ms |
-| `variance.rsqrt()` (drops eps) | 0.18ms |
-| `(variance + eps).rsqrt()` (correct method) | 0.21ms |
+| `torch.rsqrt(variance + eps)` | 0.086ms |
+| `variance.rsqrt()` (drops eps) | 0.084ms |
+| `(variance + eps).rsqrt()` (correct method) | 0.086ms |
 
-**Cautionary rule**: Always verify an "optimization" isn't just silently deleting a mathematical step. The speedup disappeared when we fixed the eps bug — there was never any real gain.
+The ~1.03x difference is within noise. When we fix the eps bug, the "speedup" disappears entirely - there was never any real gain.
 
-### 5. kv_cache_slice (0.35x for small caches)
+**Cautionary rule**: Always verify an "optimization" isn't just silently deleting a mathematical step.
+
+### 5. kv_cache_slice (0.57x for small caches)
 
 ```python
 def kv_slice(cache, new_kv):
@@ -562,7 +606,7 @@ def kv_slice(cache, new_kv):
 
 ## The Real Bottleneck
 
-Even with 1.88x kernel speedups, end-to-end inference is dominated by:
+Even with 1.83x kernel speedups, end-to-end inference is dominated by:
 
 ### 1. Memory Bandwidth
 
@@ -577,7 +621,7 @@ The attention mechanism is already using Flash Attention, which is:
 - Fused (multiple operations in one kernel)
 - Asymptotically optimal for attention
 
-**Why the attention_score speedup doesn't contradict this**: Flash Attention is used for the *main* attention computation in LLaDA-V's forward pass. The 1.88x `attention_score` speedup applies to the eager-mode fallback path or diffusion-specific attention steps that don't go through Flash Attention. On the main path, Flash Attention already handles Q-scale fusion internally — you can't improve it from Python.
+**Why the attention_score speedup doesn't contradict this**: Flash Attention is used for the *main* attention computation in LLaDA-V's forward pass. The 1.83x `attention_score` speedup applies to the eager-mode fallback path or diffusion-specific attention steps that don't go through Flash Attention. On the main path, Flash Attention already handles Q-scale fusion internally - you can't improve it from Python.
 
 **Bottom line**: The `attention_score` optimization is educational and useful for fallback paths, but won't improve the Flash Attention–bound portion of real inference.
 
@@ -597,7 +641,7 @@ cd /workspace/LLaDA-V
 # Run Round 1 benchmarks
 python3 train/kernels/master_benchmark.py
 
-# Run Round 2 (100 new kernels)
+# Run Round 2 (more kernel categories)
 python3 train/kernels_v2/more_kernels.py
 ```
 
@@ -650,7 +694,7 @@ train/kernels/
 └── ... (8 more)
 
 train/kernels_v2/
-└── more_kernels.py          # Round 2: 100 kernels across 10 categories
+└── more_kernels.py          # Round 2: ~90 variant benchmarks across 10 categories
 ```
 
 ---
@@ -661,13 +705,18 @@ train/kernels_v2/
 
 | Optimization | Speedup | Status |
 |--------------|---------|--------|
-| attention_score (fused scale) | **1.88x** | ⚠️ Benchmark only (not yet integrated) |
-| get_num_transfer_tokens | **1.62x** | ✓ In production |
-| repeat_kv | **1.58x** | ✓ In production |
-| topk_variants | **3.6x** | ✓ Algorithmic (Round 2) |
-| transfer_mask (scatter) | **4x** | ✓ Algorithmic (Round 2) |
+| confidence_gather (skip softmax) | **14–60x** | ✓ Algorithmic (Round 2) |
+| transfer_mask (scatter) | **5x** | ✓ Algorithmic (Round 2) |
+| topk_variants | **4.6x** | ✓ Algorithmic (Round 2) |
+| logits_postproc (direct argmax) | **4.5x** | ✓ Algorithmic (Round 2) |
+| stop_detect (vectorized) | **2.3x** | ✓ Algorithmic (Round 2) |
+| attention_score (fused scale) | **1.83x** | ⚠️ Benchmark only (not yet integrated) |
+| get_num_transfer_tokens | **1.73–1.77x** | ✓ In production |
+| repeat_kv | **1.12–1.31x** | ✓ In production |
 
-**Overall kernel speedup**: ~1.05x across all kernels
+**Overall kernel speedup (Round 1)**: ~1.05x across all kernels
+
+**Overall kernel speedup (Round 2)**: ~2.16x across tested categories
 
 **Estimated end-to-end speedup**: 5-10%
 
@@ -681,11 +730,13 @@ train/kernels_v2/
 
 4. **PyTorch is already optimized**: Many "obvious" optimizations (in-place ops, different dtypes) show no improvement.
 
-5. **Kernel speedups don't fully translate**: Even 2x on a kernel that takes 5% of runtime = only 5% overall speedup.
+5. **Don't compute what you don't need**: The biggest wins (confidence_gather at 14–60x, logits_postproc at 4.5x) came from eliminating unnecessary softmax computations entirely - not from doing the same work faster.
+
+6. **Kernel speedups don't fully translate**: Even 2x on a kernel that takes 5% of runtime = only 5% overall speedup.
 
 ### For Real Speedups, Consider
 
-- **torch.compile**: Uses Triton to automatically fuse operations and reduce memory allocations — exactly the manual optimizations we did here, but at the whole-graph level. Can yield 1.5-2x on transformer models. The `attention_score` pattern (scale before matmul) is exactly what `torch.compile` does automatically with `dynamic=True`.
+- **torch.compile**: Uses Triton to automatically fuse operations and reduce memory allocations - exactly the manual optimizations we did here, but at the whole-graph level. Can yield 1.5-2x on transformer models. The `attention_score` pattern (scale before matmul) is exactly what `torch.compile` does automatically with `dynamic=True`.
 - **INT8/FP8 quantization**: Reduce memory bandwidth (2-4x throughput)
 - **Batch processing**: More samples per forward pass
 - **CUDA graphs**: Reduce kernel launch overhead for small operations
@@ -696,4 +747,4 @@ Benchmarks run on NVIDIA RTX 3090 (24GB) with CUDA 12.1 and PyTorch 2.5.1.
 
 ---
 
-*Last updated: March 31, 2026*
+*Last updated: April 1, 2026*
